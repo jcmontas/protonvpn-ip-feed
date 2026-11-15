@@ -1,0 +1,47 @@
+
+name: Update ProtonVPN IPv4 Feed
+
+on:
+  schedule:
+    - cron: "0 7 * * *"  # 03:00 Dominican Republic
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: protonvpn-ip-feed
+  cancel-in-progress: false
+
+jobs:
+  update-feed:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y whois
+
+      - name: Generate ProtonVPN IPv4 feed
+        run: python scripts/update_feed.py
+
+      - name: Publish updated feed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add protonvpn-ipv4.txt
+          if ! git diff --cached --quiet; then
+            git commit -m "Update ProtonVPN IPv4 feed"
+            git push
+          else
+            echo "No changes in ProtonVPN prefixes."
+          fi
