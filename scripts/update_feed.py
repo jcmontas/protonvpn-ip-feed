@@ -8,6 +8,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,15 +23,20 @@ ASNS = [
 ]
 
 OUTPUT = Path("protonvpn-ipv4.txt")
+TEMP_OUTPUT = OUTPUT.with_suffix(".txt.tmp")
+
 MINIMUM_PREFIX_COUNT = 10
 
-REQUEST_TIMEOUT = 90
-MAX_ATTEMPTS = 4
-RETRY_DELAYS = [10, 20, 40]
+MAX_WORKERS = 5
+REQUEST_TIMEOUT = 45
+MAX_ATTEMPTS = 3
+RETRY_DELAYS = [5, 15]
 
 
 def fetch_asn_prefixes(asn):
-    params = urllib.parse.urlencode({"resource": f"AS{asn}"})
+    params = urllib.parse.urlencode({
+        "resource": f"AS{asn}"
+    })
 
     url = (
         "https://stat.ripe.net/data/announced-prefixes/data.json?"
@@ -38,14 +45,20 @@ def fetch_asn_prefixes(asn):
 
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": "ProtonVPN-IP-Feed/1.0"}
+        headers={
+            "User-Agent": "VPN-IP-Feed/2.0",
+            "Accept": "application/json"
+        }
     )
 
+    last_error = None
+
     for attempt in range(1, MAX_ATTEMPTS + 1):
+
         try:
             print(
-                f"AS{asn}: request attempt "
-                f"{attempt}/{MAX_ATTEMPTS}"
+                f"[AS{asn}] Attempt {attempt}/{MAX_ATTEMPTS}",
+                flush=True
             )
 
             with urllib.request.urlopen(
@@ -64,11 +77,39 @@ def fetch_asn_prefixes(asn):
                     f"Invalid RIPEstat response for AS{asn}"
                 )
 
-            return prefixes
+            accepted = set()
+
+            for entry in prefixes:
+                try:
+                    network = ipaddress.ip_network(
+                        entry["prefix"],
+                        strict=False
+                    )
+
+                    if network.version != 4:
+                        continue
+
+                    if not network.is_global or network.prefixlen < 8:
+                        print(
+                            f"[AS{asn}] Rejected: {network}",
+                            flush=True
+                        )
+                        continue
+
+                    accepted.add(str(network))
+
+                except (ValueError, KeyError, TypeError):
+                    continue
+
+            print(
+                f"[AS{asn}] SUCCESS: {len(accepted)} prefixes",
+                flush=True
+            )
+
+            return asn, accepted
 
         except urllib.error.HTTPError as error:
 
-            # Retry only temporary server/rate-limit errors
             if error.code != 429 and error.code < 500:
                 raise
 
@@ -84,12 +125,14 @@ def fetch_asn_prefixes(asn):
             last_error = error
 
         if attempt < MAX_ATTEMPTS:
+
             delay = RETRY_DELAYS[attempt - 1]
 
             print(
-                f"AS{asn}: temporary error: {last_error}"
+                f"[AS{asn}] Error: {last_error}. "
+                f"Retrying in {delay}s...",
+                flush=True
             )
-            print(f"Retrying in {delay} seconds...")
 
             time.sleep(delay)
 
@@ -100,47 +143,89 @@ def fetch_asn_prefixes(asn):
 
 
 def main():
-    networks = set()
-    total_by_asn = {}
 
-    print("Starting ProtonVPN IPv4 feed generation")
-    print(f"Total ASNs: {len(ASNS)}")
+    print("=" * 55, flush=True)
+    print("Starting VPN IPv4 feed generation", flush=True)
+    print(f"Total ASNs: {len(ASNS)}", flush=True)
+    print(f"Concurrent workers: {MAX_WORKERS}", flush=True)
+    print("=" * 55, flush=True)
 
-    for asn in ASNS:
-        print(f"\nQuerying AS{asn}...")
+    results = {}
+    errors = []
 
-        entries = fetch_asn_prefixes(asn)
-        accepted = 0
+    with ThreadPoolExecutor(
+        max_workers=MAX_WORKERS
+    ) as executor:
 
-        for entry in entries:
+        futures = {
+            executor.submit(fetch_asn_prefixes, asn): asn
+            for asn in ASNS
+        }
+
+        completed = 0
+
+        for future in as_completed(futures):
+
+            asn = futures[future]
+            completed += 1
+
             try:
-                network = ipaddress.ip_network(
-                    entry["prefix"], strict=False
+                result_asn, prefixes = future.result()
+                results[result_asn] = prefixes
+
+                print(
+                    f"PROGRESS: {completed}/{len(ASNS)} "
+                    f"ASNs completed",
+                    flush=True
                 )
 
-                # IPv4 only
-                if network.version != 4:
-                    continue
+            except Exception as error:
 
-                # Exclude non-global and excessively broad prefixes
-                if not network.is_global or network.prefixlen < 8:
-                    print(f"Rejected suspicious prefix: {network}")
-                    continue
+                errors.append((asn, str(error)))
 
-                networks.add(str(network))
-                accepted += 1
+                print(
+                    f"FAILED AS{asn}: {error}",
+                    flush=True
+                )
 
-            except (ValueError, KeyError, TypeError):
-                continue
+                print(
+                    f"PROGRESS: {completed}/{len(ASNS)} "
+                    f"ASNs completed",
+                    flush=True
+                )
 
-        total_by_asn[asn] = accepted
+    # Never publish if any ASN query failed
+    if errors:
 
-        print(f"AS{asn}: {accepted} accepted prefixes")
+        print("\nERROR SUMMARY", flush=True)
+
+        for asn, error in errors:
+            print(f"AS{asn}: {error}", flush=True)
+
+        raise RuntimeError(
+            f"{len(errors)} ASN queries failed. "
+            "Existing feed preserved."
+        )
+
+    if len(results) != len(ASNS):
+        raise RuntimeError(
+            "ASN result count mismatch. Existing feed preserved."
+        )
+
+    networks = set()
+
+    print("\nASN SUMMARY", flush=True)
+
+    for asn in ASNS:
+        count = len(results[asn])
+        networks.update(results[asn])
+
+        print(f"AS{asn}: {count}", flush=True)
 
     if len(networks) < MINIMUM_PREFIX_COUNT:
         raise RuntimeError(
             f"Only {len(networks)} prefixes collected. "
-            "Refusing to publish incomplete feed."
+            "Existing feed preserved."
         )
 
     sorted_networks = sorted(
@@ -151,24 +236,29 @@ def main():
         )
     )
 
-    # Write only after all ASN queries have completed successfully
-    OUTPUT.write_text(
+    # Write to temporary file first
+    TEMP_OUTPUT.write_text(
         "\n".join(sorted_networks) + "\n",
         encoding="utf-8"
     )
 
-    print("\nASN SUMMARY")
+    # Atomic replacement after successful collection
+    TEMP_OUTPUT.replace(OUTPUT)
 
-    for asn, count in total_by_asn.items():
-        print(f"AS{asn}: {count}")
-
-    print(f"\nTotal unique IPv4 prefixes: {len(sorted_networks)}")
-    print(f"Output: {OUTPUT}")
-
+    print("\n" + "=" * 55, flush=True)
+    print("FEED GENERATION SUCCESSFUL", flush=True)
+    print(f"ASNs processed: {len(results)}", flush=True)
+    print(
+        f"Total unique IPv4 prefixes: {len(sorted_networks)}",
+        flush=True
+    )
+    print(f"Output: {OUTPUT}", flush=True)
     print(
         "Generated:",
-        datetime.now(timezone.utc).isoformat()
+        datetime.now(timezone.utc).isoformat(),
+        flush=True
     )
+    print("=" * 55, flush=True)
 
 
 if __name__ == "__main__":
