@@ -3,6 +3,9 @@
 
 import ipaddress
 import json
+import socket
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -20,8 +23,14 @@ ASNS = [
 OUTPUT = Path("protonvpn-ipv4.txt")
 MINIMUM_PREFIX_COUNT = 10
 
+REQUEST_TIMEOUT = 90
+MAX_ATTEMPTS = 4
+RETRY_DELAYS = [10, 20, 40]
+
+
 def fetch_asn_prefixes(asn):
     params = urllib.parse.urlencode({"resource": f"AS{asn}"})
+
     url = (
         "https://stat.ripe.net/data/announced-prefixes/data.json?"
         + params
@@ -32,15 +41,62 @@ def fetch_asn_prefixes(asn):
         headers={"User-Agent": "ProtonVPN-IP-Feed/1.0"}
     )
 
-    with urllib.request.urlopen(request, timeout=45) as response:
-        result = json.loads(response.read().decode("utf-8"))
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            print(
+                f"AS{asn}: request attempt "
+                f"{attempt}/{MAX_ATTEMPTS}"
+            )
 
-    prefixes = result.get("data", {}).get("prefixes")
+            with urllib.request.urlopen(
+                request,
+                timeout=REQUEST_TIMEOUT
+            ) as response:
 
-    if not isinstance(prefixes, list):
-        raise RuntimeError(f"Invalid RIPEstat response for AS{asn}")
+                result = json.loads(
+                    response.read().decode("utf-8")
+                )
 
-    return prefixes
+            prefixes = result.get("data", {}).get("prefixes")
+
+            if not isinstance(prefixes, list):
+                raise RuntimeError(
+                    f"Invalid RIPEstat response for AS{asn}"
+                )
+
+            return prefixes
+
+        except urllib.error.HTTPError as error:
+
+            # Retry only temporary server/rate-limit errors
+            if error.code != 429 and error.code < 500:
+                raise
+
+            last_error = error
+
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            socket.timeout,
+            json.JSONDecodeError
+        ) as error:
+
+            last_error = error
+
+        if attempt < MAX_ATTEMPTS:
+            delay = RETRY_DELAYS[attempt - 1]
+
+            print(
+                f"AS{asn}: temporary error: {last_error}"
+            )
+            print(f"Retrying in {delay} seconds...")
+
+            time.sleep(delay)
+
+    raise RuntimeError(
+        f"AS{asn} failed after {MAX_ATTEMPTS} attempts: "
+        f"{last_error}"
+    )
 
 
 def main():
@@ -48,9 +104,10 @@ def main():
     total_by_asn = {}
 
     print("Starting ProtonVPN IPv4 feed generation")
+    print(f"Total ASNs: {len(ASNS)}")
 
     for asn in ASNS:
-        print(f"Querying AS{asn}...")
+        print(f"\nQuerying AS{asn}...")
 
         entries = fetch_asn_prefixes(asn)
         accepted = 0
@@ -77,6 +134,7 @@ def main():
                 continue
 
         total_by_asn[asn] = accepted
+
         print(f"AS{asn}: {accepted} accepted prefixes")
 
     if len(networks) < MINIMUM_PREFIX_COUNT:
@@ -100,6 +158,7 @@ def main():
     )
 
     print("\nASN SUMMARY")
+
     for asn, count in total_by_asn.items():
         print(f"AS{asn}: {count}")
 
