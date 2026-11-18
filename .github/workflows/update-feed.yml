@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: protonvpn-ip-feed
@@ -16,32 +16,40 @@ concurrency:
 jobs:
   update-feed:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y whois
 
       - name: Generate ProtonVPN IPv4 feed
         run: python scripts/update_feed.py
 
       - name: Publish updated feed
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add protonvpn-ipv4.txt
+
           if ! git diff --cached --quiet; then
             git commit -m "Update ProtonVPN IPv4 feed"
-            git push
+
+            AUTH_HEADER=$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w 0)
+
+            git -c http.extraheader="AUTHORIZATION: basic $AUTH_HEADER" push
           else
             echo "No changes in ProtonVPN prefixes."
           fi
