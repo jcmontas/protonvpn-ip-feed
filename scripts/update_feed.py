@@ -26,6 +26,7 @@ OUTPUT = Path("protonvpn-ipv4.txt")
 TEMP_OUTPUT = OUTPUT.with_suffix(".txt.tmp")
 
 MINIMUM_PREFIX_COUNT = 10
+MAX_CHANGE_RATIO = 0.10
 
 MAX_WORKERS = 5
 REQUEST_TIMEOUT = 45
@@ -222,12 +223,51 @@ def main():
 
         print(f"AS{asn}: {count}", flush=True)
 
+    # Minimum feed size validation
     if len(networks) < MINIMUM_PREFIX_COUNT:
         raise RuntimeError(
             f"Only {len(networks)} prefixes collected. "
             "Existing feed preserved."
         )
 
+    # Compare against previously published feed
+    if OUTPUT.exists():
+
+        previous_networks = set(
+            OUTPUT.read_text(encoding="utf-8").splitlines()
+        )
+
+        if previous_networks:
+
+            added = networks - previous_networks
+            removed = previous_networks - networks
+
+            change_ratio = (
+                len(added) + len(removed)
+            ) / len(previous_networks)
+
+            print(
+                f"Prefixes added: {len(added)}",
+                flush=True
+            )
+
+            print(
+                f"Prefixes removed: {len(removed)}",
+                flush=True
+            )
+
+            print(
+                f"Feed change ratio: {change_ratio:.2%}",
+                flush=True
+            )
+
+            if change_ratio > MAX_CHANGE_RATIO:
+                raise RuntimeError(
+                    f"Abnormal feed change: {change_ratio:.2%}. "
+                    "Manual review required. Existing feed preserved."
+                )
+
+    # Sort IPv4 networks
     sorted_networks = sorted(
         networks,
         key=lambda item: (
